@@ -7,84 +7,146 @@ import (
 	"log"
 	"math/rand"
 	"strings"
-	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
 	"sms-api-service/models"
 )
 
-var (
-	dbMutex sync.Mutex
-)
+// DatabaseConfig содержит конфигурацию для подключения к БД
+type DatabaseConfig struct {
+	Path            string
+	JournalMode     string
+	Timeout         int
+	Synchronous     string
+	CacheSize       int
+	BusyTimeout     int
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
+}
 
-func Init(dbPath string) (*sql.DB, error) {
-	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_timeout=30000&_synchronous=NORMAL&_cache_size=1000&_busy_timeout=30000", dbPath)
+// DefaultConfig возвращает конфигурацию по умолчанию
+func DefaultConfig(dbPath string) *DatabaseConfig {
+	return &DatabaseConfig{
+		Path:            dbPath,
+		JournalMode:     "WAL",
+		Timeout:         30000,
+		Synchronous:     "NORMAL",
+		CacheSize:       1000,
+		BusyTimeout:     30000,
+		MaxOpenConns:    1,
+		MaxIdleConns:    1,
+		ConnMaxLifetime: time.Hour,
+	}
+}
+
+// Database представляет обертку над sql.DB с дополнительной функциональностью
+type Database struct {
+	*sql.DB
+	config *DatabaseConfig
+}
+
+// Init инициализирует подключение к базе данных
+func Init(config *DatabaseConfig) (*Database, error) {
+	dsn := fmt.Sprintf("%s?_journal_mode=%s&_timeout=%d&_synchronous=%s&_cache_size=%d&_busy_timeout=%d",
+		config.Path, config.JournalMode, config.Timeout, config.Synchronous, config.CacheSize, config.BusyTimeout)
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(time.Hour)
+	db.SetMaxOpenConns(config.MaxOpenConns)
+	db.SetMaxIdleConns(config.MaxIdleConns)
+	db.SetConnMaxLifetime(config.ConnMaxLifetime)
 
 	if err := db.Ping(); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	if err := createTables(db); err != nil {
-		return nil, err
+	database := &Database{
+		DB:     db,
+		config: config,
 	}
 
-	return db, nil
+	if err := database.createTables(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to create tables: %w", err)
+	}
+
+	return database, nil
 }
 
-func executeWithRetry(db *sql.DB, query string, args ...interface{}) error {
-	maxRetries := 5
-	baseDelay := 100 * time.Millisecond
+// Close закрывает подключение к БД
+func (d *Database) Close() error {
+	if d.DB != nil {
+		return d.DB.Close()
+	}
+	return nil
+}
+
+// ExecuteWithRetry выполняет запрос с повторными попытками при блокировке БД
+func (d *Database) ExecuteWithRetry(ctx context.Context, query string, args ...interface{}) error {
+	const (
+		maxRetries = 5
+		baseDelay  = 100 * time.Millisecond
+	)
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctxWithTimeout, cancel := context.WithTimeout(ctx, 10*time.Second)
 
-		_, err := db.ExecContext(ctx, query, args...)
+		_, err := d.ExecContext(ctxWithTimeout, query, args...)
 		cancel()
 
 		if err == nil {
 			return nil
 		}
 
-		if strings.Contains(err.Error(), "database is locked") ||
-			strings.Contains(err.Error(), "SQLITE_BUSY") ||
-			strings.Contains(err.Error(), "database table is locked") {
-
-			if attempt < maxRetries-1 {
-				delay := baseDelay * time.Duration(1<<uint(attempt))
-				log.Printf("Database locked, retrying in %v (attempt %d/%d)", delay, attempt+1, maxRetries)
-				time.Sleep(delay)
-				continue
-			}
+		if !isRetryableError(err) {
+			return fmt.Errorf("database operation failed: %w", err)
 		}
 
-		return fmt.Errorf("database operation failed: %w", err)
+		if attempt < maxRetries-1 {
+			delay := baseDelay * time.Duration(1<<uint(attempt))
+			log.Printf("Database locked, retrying in %v (attempt %d/%d)", delay, attempt+1, maxRetries)
+
+			select {
+			case <-time.After(delay):
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 	}
 
 	return fmt.Errorf("database locked after %d attempts", maxRetries)
 }
 
-func createTables(db *sql.DB) error {
+// isRetryableError проверяет, является ли ошибка повторяемой
+func isRetryableError(err error) bool {
+	errStr := err.Error()
+	return strings.Contains(errStr, "database is locked") ||
+		strings.Contains(errStr, "SQLITE_BUSY") ||
+		strings.Contains(errStr, "database table is locked")
+}
+
+// createTables создает необходимые таблицы
+func (d *Database) createTables() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS countries (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		code TEXT UNIQUE NOT NULL,
-		name TEXT NOT NULL
+		name TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
 	CREATE TABLE IF NOT EXISTS services (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		code TEXT UNIQUE NOT NULL,
-		name TEXT NOT NULL
+		name TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
 	CREATE TABLE IF NOT EXISTS phone_numbers (
@@ -93,6 +155,7 @@ func createTables(db *sql.DB) error {
 		country_id INTEGER NOT NULL,
 		operator TEXT NOT NULL,
 		available BOOLEAN DEFAULT TRUE,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY (country_id) REFERENCES countries (id)
 	);
 
@@ -115,167 +178,202 @@ func createTables(db *sql.DB) error {
 		received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY (activation_id) REFERENCES activations (id)
 	);
+
+	-- Индексы для оптимизации запросов
+	CREATE INDEX IF NOT EXISTS idx_phone_numbers_country_available ON phone_numbers(country_id, available);
+	CREATE INDEX IF NOT EXISTS idx_activations_status ON activations(status);
+	CREATE INDEX IF NOT EXISTS idx_activations_created_at ON activations(created_at);
+	CREATE INDEX IF NOT EXISTS idx_sms_messages_activation_id ON sms_messages(activation_id);
 	`
 
-	return executeWithRetry(db, schema)
+	ctx := context.Background()
+	return d.ExecuteWithRetry(ctx, schema)
 }
 
-func Seed(db *sql.DB) error {
-	// Используем мьютекс для предотвращения конкурентного доступа
-	dbMutex.Lock()
-	defer dbMutex.Unlock()
+// SeedData структура для конфигурации тестовых данных
+type SeedData struct {
+	Countries    []models.Country
+	Services     []models.Service
+	NumbersRange struct {
+		Min, Max int
+	}
+}
 
-	if err := seedCountries(db); err != nil {
-		return err
+// DefaultSeedData возвращает данные для заполнения по умолчанию
+func DefaultSeedData() *SeedData {
+	return &SeedData{
+		Countries: []models.Country{
+			{Code: "rus", Name: "Russia"},
+			{Code: "uzb", Name: "Uzbekistan"},
+			{Code: "bel", Name: "Belarus"},
+		},
+		Services: []models.Service{
+			{Code: "vk", Name: "VKontakte"},
+			{Code: "ok", Name: "Odnoklassniki"},
+			{Code: "wa", Name: "WhatsApp"},
+			{Code: "tg", Name: "Telegram"},
+			{Code: "fb", Name: "Facebook"},
+		},
+		NumbersRange: struct{ Min, Max int }{Min: 20, Max: 30},
+	}
+}
+
+// Seed заполняет базу данных тестовыми данными
+func (d *Database) Seed(ctx context.Context, seedData *SeedData) error {
+	if err := d.seedCountries(ctx, seedData.Countries); err != nil {
+		return fmt.Errorf("failed to seed countries: %w", err)
 	}
 
-	if err := seedServices(db); err != nil {
-		return err
+	if err := d.seedServices(ctx, seedData.Services); err != nil {
+		return fmt.Errorf("failed to seed services: %w", err)
 	}
 
-	if err := generateTestNumbers(db); err != nil {
-		return err
+	if err := d.generateTestNumbers(ctx, seedData.NumbersRange.Min, seedData.NumbersRange.Max); err != nil {
+		return fmt.Errorf("failed to generate test numbers: %w", err)
 	}
+
 	log.Print("Data seeded successfully")
 	return nil
 }
 
-func seedCountries(db *sql.DB) error {
-	countries := []models.Country{
-		{Code: "rus", Name: "Russia"},
-		{Code: "uzb", Name: "Uzbekistan"},
-		{Code: "bel", Name: "Belarus"},
+// seedCountries заполняет таблицу стран
+func (d *Database) seedCountries(ctx context.Context, countries []models.Country) error {
+	for _, country := range countries {
+		err := d.ExecuteWithRetry(ctx, "INSERT OR IGNORE INTO countries (code, name) VALUES (?, ?)",
+			country.Code, country.Name)
+		if err != nil {
+			return fmt.Errorf("failed to insert country %s: %w", country.Code, err)
+		}
+	}
+	return nil
+}
+
+// seedServices заполняет таблицу сервисов
+func (d *Database) seedServices(ctx context.Context, services []models.Service) error {
+	for _, service := range services {
+		err := d.ExecuteWithRetry(ctx, "INSERT OR IGNORE INTO services (code, name) VALUES (?, ?)",
+			service.Code, service.Name)
+		if err != nil {
+			return fmt.Errorf("failed to insert service %s: %w", service.Code, err)
+		}
+	}
+	return nil
+}
+
+// CountryPrefix представляет префикс страны для генерации номеров
+type CountryPrefix struct {
+	ID     int
+	Code   string
+	Prefix uint64
+}
+
+// getCountryPrefixes возвращает префиксы стран
+func getCountryPrefixes() map[string]uint64 {
+	return map[string]uint64{
+		"rus": 7,
+		"uzb": 998,
+		"bel": 375,
+	}
+}
+
+// generateTestNumbers генерирует тестовые номера телефонов
+func (d *Database) generateTestNumbers(ctx context.Context, minCount, maxCount int) error {
+	countries, err := d.getCountriesWithPrefixes(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get countries: %w", err)
 	}
 
 	for _, country := range countries {
-		err := executeWithRetry(db, "INSERT OR IGNORE INTO countries (code, name) VALUES (?, ?)",
-			country.Code, country.Name)
-		if err != nil {
-			return err
+		numCount := rand.Intn(maxCount-minCount+1) + minCount
+
+		if err := d.insertNumbersBatch(ctx, country, numCount); err != nil {
+			return fmt.Errorf("failed to insert numbers for country %s: %w", country.Code, err)
 		}
 	}
 
 	return nil
 }
 
-func seedServices(db *sql.DB) error {
-	services := []models.Service{
-		{Code: "vk", Name: "VKontakte"},
-		{Code: "ok", Name: "Odnoklassniki"},
-		{Code: "wa", Name: "WhatsApp"},
-		{Code: "tg", Name: "Telegram"},
-		{Code: "fb", Name: "Facebook"},
-	}
-
-	for _, service := range services {
-		err := executeWithRetry(db, "INSERT OR IGNORE INTO services (code, name) VALUES (?, ?)",
-			service.Code, service.Name)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func generateTestNumbers(db *sql.DB) error {
-	rand.Seed(time.Now().UnixNano())
-
-	// Используем контекст с таймаутом для запроса
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	rows, err := db.QueryContext(ctx, "SELECT id, code FROM countries")
+// getCountriesWithPrefixes получает страны с их префиксами
+func (d *Database) getCountriesWithPrefixes(ctx context.Context) ([]CountryPrefix, error) {
+	rows, err := d.QueryContext(ctx, "SELECT id, code FROM countries")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer rows.Close()
 
-	countryPrefixes := map[int]uint64{
-		1: 7,   // Russia
-		2: 998, // Uzbekistan
-		3: 375, // Belarus
-	}
-
-	countries := make([]struct {
-		ID   int
-		Code string
-	}, 0)
+	prefixes := getCountryPrefixes()
+	var countries []CountryPrefix
 
 	for rows.Next() {
-		var countryID int
-		var countryCode string
-		if err := rows.Scan(&countryID, &countryCode); err != nil {
+		var cp CountryPrefix
+		if err := rows.Scan(&cp.ID, &cp.Code); err != nil {
 			continue
 		}
-		countries = append(countries, struct {
-			ID   int
-			Code string
-		}{countryID, countryCode})
+
+		if prefix, exists := prefixes[cp.Code]; exists {
+			cp.Prefix = prefix
+			countries = append(countries, cp)
+		}
 	}
-	rows.Close()
 
-	for _, country := range countries {
-		prefix, exists := countryPrefixes[country.ID]
-		if !exists {
-			continue
+	return countries, rows.Err()
+}
+
+// insertNumbersBatch вставляет номера телефонов батчами
+func (d *Database) insertNumbersBatch(ctx context.Context, country CountryPrefix, count int) error {
+	const batchSize = 100
+
+	for i := 0; i < count; i += batchSize {
+		end := i + batchSize
+		if end > count {
+			end = count
 		}
 
-		numCount := rand.Intn(11) + 20
-
-		batchSize := 10
-		for i := 0; i < numCount; i += batchSize {
-			end := i + batchSize
-			if end > numCount {
-				end = numCount
-			}
-
-			tx, err := db.Begin()
-			if err != nil {
-				log.Printf("Error starting transaction: %v", err)
-				continue
-			}
-
-			for j := i; j < end; j++ {
-				var number uint64
-				if prefix == 7 { // Russia
-					number = 79000000000 + uint64(rand.Intn(999999999))
-				} else if prefix == 998 { // Uzbekistan
-					number = 998000000000 + uint64(rand.Intn(999999999))
-				} else { // Belarus
-					number = 375000000000 + uint64(rand.Intn(999999999))
-				}
-
-				operator := "any"
-				_, err := tx.Exec(`INSERT OR IGNORE INTO phone_numbers 
-					(number, country_id, operator, available) VALUES (?, ?, ?, ?)`,
-					number, country.ID, operator, true)
-				if err != nil {
-					log.Printf("Error inserting number in transaction: %v", err)
-				}
-			}
-
-			maxRetries := 3
-			var commitErr error
-			for attempt := 0; attempt < maxRetries; attempt++ {
-				commitErr = tx.Commit()
-				if commitErr == nil {
-					break
-				}
-
-				if strings.Contains(commitErr.Error(), "database is locked") {
-					time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
-					continue
-				}
-				break
-			}
-
-			if commitErr != nil {
-				tx.Rollback()
-				log.Printf("Error committing transaction: %v", commitErr)
-			}
+		if err := d.insertNumbersBatchTx(ctx, country, i, end); err != nil {
+			return err
 		}
 	}
 
 	return nil
+}
+
+// insertNumbersBatchTx вставляет батч номеров в рамках транзакции
+func (d *Database) insertNumbersBatchTx(ctx context.Context, country CountryPrefix, start, end int) error {
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO phone_numbers 
+		(number, country_id, operator, available) VALUES (?, ?, ?, ?)`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare statement: %w", err)
+	}
+	defer stmt.Close()
+
+	for i := start; i < end; i++ {
+		number := d.generatePhoneNumber(country.Prefix)
+
+		if _, err := stmt.ExecContext(ctx, number, country.ID, "any", true); err != nil {
+			log.Printf("Failed to insert number %d: %v", number, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// generatePhoneNumber генерирует номер телефона для заданного префикса
+func (d *Database) generatePhoneNumber(prefix uint64) uint64 {
+	switch prefix {
+	case 7: // Russia
+		return 79000000000 + uint64(rand.Intn(999999999))
+	case 998: // Uzbekistan
+		return 998000000000 + uint64(rand.Intn(999999999))
+	case 375: // Belarus
+		return 375000000000 + uint64(rand.Intn(999999999))
+	default:
+		return prefix*1000000000 + uint64(rand.Intn(999999999))
+	}
 }
